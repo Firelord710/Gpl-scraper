@@ -1,20 +1,24 @@
 import json
 import logging
-import time
+import datetime
 import os
 import random
 import signal
 from typing import List, Dict, Any
 from urllib.parse import urlparse
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import time
+import glob
+import urllib.parse
+import hashlib
 
-from json_to_csv import process_graphql_responses
+
+from json_to_csv import process_api_responses, process_graphql_responses
 
 # Load environment variables
 try:
@@ -163,12 +167,15 @@ def handle_age_confirmation(page):
 
 def custom_timeout_handler(page, timeout):
     try:
+        logging.info(f"Waiting for networkidle state (timeout: {timeout}ms)...")
         page.wait_for_load_state("networkidle", timeout=timeout)
+        logging.info("Networkidle state reached")
     except PlaywrightTimeoutError:
-        logging.warning(f"Networkidle not reached, checking if page is usable")
+        logging.warning(f"Networkidle not reached after {timeout}ms, checking if page is usable")
         if page.query_selector('body'):
             logging.info("Page body found, continuing with scraping")
         else:
+            logging.error("Page body not found after timeout")
             raise PlaywrightTimeoutError("Page body not found after timeout")
 
 
@@ -184,29 +191,39 @@ def retry_on_network_error(func):
     return wrapper
 
 
-def save_progress(url, responses, graphql_url):
-    progress_file = f"progress_{url.replace('https://', '').replace('http://', '').replace('/', '_')}.pkl"
-    with open(progress_file, 'wb') as f:
-        pickle.dump({'responses': responses, 'graphql_url': graphql_url}, f)
-    logging.info(f"Progress saved for URL: {url}")
+def save_progress(filename, responses, graphql_url):
+    try:
+        with open(filename, 'wb') as f:
+            pickle.dump({'responses': responses, 'graphql_url': graphql_url}, f)
+        logging.info(f"Progress saved to file: {filename}")
+    except Exception as e:
+        logging.error(f"Error saving progress to {filename}: {str(e)}")
 
 
-def load_progress(url):
-    progress_file = f"progress_{url.replace('https://', '').replace('http://', '').replace('/', '_')}.pkl"
-    if os.path.exists(progress_file):
-        with open(progress_file, 'rb') as f:
-            progress = pickle.load(f)
-        logging.info(f"Progress loaded for URL: {url}")
-        return progress['responses'], progress['graphql_url']
-    return None, None
+def load_progress(filename):
+    try:
+        if os.path.exists(filename):
+            with open(filename, 'rb') as f:
+                progress = pickle.load(f)
+            logging.info(f"Progress loaded from file: {filename}")
+            return progress['responses'], progress['graphql_url']
+    except Exception as e:
+        logging.error(f"Error loading progress from {filename}: {str(e)}")
+    return [], None
 
 
 def sanitize_filename(filename):
     return "".join([c for c in filename if c.isalpha() or c.isdigit() or c in [' ', '-', '_']]).rstrip()
 
 
+def should_retry_exception(exception):
+    return isinstance(exception, (PlaywrightTimeoutError, ConnectionError))
+
+
 @performance_monitor
-@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=4, max=10))
+@retry(stop=stop_after_attempt(MAX_RETRIES),
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       retry=retry_if_exception(should_retry_exception))
 def scrape_url(url: str):
     if not is_valid_url(url):
         logging.error(f"Invalid URL: {url}")
@@ -215,100 +232,247 @@ def scrape_url(url: str):
     sanitized_url = sanitize_filename(url)
     progress_file = f"progress_{sanitized_url}.pkl"
 
-    url_responses, saved_graphql_url = load_progress(progress_file)
+    url_responses, saved_api_url = load_progress(progress_file)
     if url_responses:
-        logging.info(f"Resuming scraping for URL: {url}")
+        logging.info(f"Resuming scraping for URL: {url} with {len(url_responses)} saved responses")
     else:
+        logging.info(f"Starting new scrape for URL: {url}")
         url_responses = []
+        saved_api_url = None
 
-    timeout_retries = 0
-    max_timeout_retries = 3  # You can adjust this value
+    last_response_time = time.time()
+    no_new_responses_timeout = 30  # Time in seconds to wait for new responses before concluding
 
-    while timeout_retries <= max_timeout_retries:
-        with sync_playwright() as p:
+    # Create a folder with today's date
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    base_output_folder = os.path.join(os.getcwd(), today)
+    os.makedirs(base_output_folder, exist_ok=True)
+
+    # Create a subfolder for this specific URL
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:10]  # Use first 10 characters of MD5 hash
+    url_folder_name = f"{urllib.parse.urlparse(url).netloc}_{url_hash}"
+    output_folder = os.path.join(base_output_folder, sanitize_filename(url_folder_name))
+    os.makedirs(output_folder, exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS_MODE)
+        context = browser.new_context(user_agent=random.choice(USER_AGENTS))
+        page = context.new_page()
+
+        api_url = saved_api_url  # Use saved API URL if available
+
+        def handle_response(response):
+            nonlocal api_url, url_responses, last_response_time
+            if response.request.resource_type in ["fetch", "xhr"]:
+                is_dutchie = "dutchie.com" in response.url.lower()
+                is_iheartjane = "iheartjane.com" in response.url.lower() or "x-algolia-agent" in response.request.headers
+
+                if is_dutchie:
+                    # Handle Dutchie URLs as GraphQL
+                    api_url = response.url  # Capture the API URL
+                    try:
+                        json_response = response.json()
+                        if not any(existing_response == json_response for existing_response in url_responses):
+                            url_responses.append(json_response)
+                            last_response_time = time.time()
+                            logging.info(f"New Dutchie (GraphQL) response captured. Total responses: {len(url_responses)}")
+                            save_progress(progress_file, url_responses, api_url)
+
+                            # Write CSVs with current responses
+                            timestamp = int(time.time())
+                            output_file_dutchie = os.path.join(output_folder, f"output_dutchie_{sanitized_url}_{timestamp}.csv")
+                            output_file_generic = os.path.join(output_folder, f"output_generic_{sanitized_url}_{timestamp}.csv")
+                            output_file_unflattened = os.path.join(output_folder, f"output_unflattened_{sanitized_url}_{timestamp}.csv")
+                            process_graphql_responses(url_responses, output_file_dutchie, output_file_generic, output_file_unflattened, api_url)
+
+                    except json.JSONDecodeError:
+                        logging.warning(f"Failed to parse JSON response for URL: {url}")
+                    except Exception as e:
+                        logging.error(f"Error processing Dutchie (GraphQL) response for URL {url}: {str(e)}")
+
+                elif is_iheartjane:
+                    # Handle iHeartJane URLs as JSON
+                    api_url = response.url  # Capture the API URL
+                    try:
+                        json_response = response.json()
+                        if not any(existing_response == json_response for existing_response in url_responses):
+                            url_responses.append(json_response)
+                            last_response_time = time.time()
+                            logging.info(f"New iHeartJane (JSON) response captured. Total responses: {len(url_responses)}")
+                            save_progress(progress_file, url_responses, api_url)
+
+                            # Write CSVs with current responses
+                            timestamp = int(time.time())
+                            output_file_cleaned = os.path.join(output_folder, f"output_cleaned_{sanitized_url}_{timestamp}.csv")
+                            output_file_generic = os.path.join(output_folder, f"output_generic_{sanitized_url}_{timestamp}.csv")
+                            output_file_unflattened = os.path.join(output_folder, f"output_unflattened_{sanitized_url}_{timestamp}.csv")
+                            process_api_responses(url_responses, output_file_cleaned, output_file_generic, output_file_unflattened, api_url)
+
+                    except json.JSONDecodeError:
+                        logging.warning(f"Failed to parse JSON response for URL: {url}")
+                    except Exception as e:
+                        logging.error(f"Error processing iHeartJane (JSON) response for URL {url}: {str(e)}")
+
+        page.on("response", handle_response)
+
+        try:
+            logging.info(f"Navigating to URL: {url}")
             try:
-                browser = p.chromium.launch(headless=HEADLESS_MODE)
-                context = browser.new_context(user_agent=random.choice(USER_AGENTS))
-                page = context.new_page()
-
-                graphql_url = saved_graphql_url  # Use saved GraphQL URL if available
-
-                def handle_response_for_url(response):
-                    nonlocal graphql_url
-                    if (
-                            response.request.resource_type == "fetch" or response.request.resource_type == "xhr") and "graphql" in response.url.lower():
-                        graphql_url = response.url  # Capture the GraphQL URL
-                        try:
-                            json_response = response.json()
-                            if json_response not in url_responses:
-                                url_responses.append(json_response)
-                                save_progress(progress_file, url_responses, graphql_url)
-                        except json.JSONDecodeError:
-                            logging.warning(f"Failed to parse JSON response for URL: {url}")
-                        except Exception as e:
-                            logging.error(f"Error processing response for URL {url}: {str(e)}")
-
-                page.on("request", intercept_graphql)
-                page.on("response", handle_response_for_url)
-
                 page.goto(url)
-                try:
-                    custom_timeout_handler(page, REQUEST_TIMEOUT)
-                    logging.info(f"Loaded: {url}")
+            except Exception as e:
+                if "net::ERR_HTTP2_PROTOCOL_ERROR" in str(e):
+                    logging.warning(f"Encountered HTTP/2 protocol error for URL: {url}. Skipping...")
+                    return
+                else:
+                    raise
 
-                    handle_age_confirmation(page)
+            logging.info("Waiting for page load...")
+            custom_timeout_handler(page, REQUEST_TIMEOUT)
+            logging.info(f"Loaded: {url}")
 
-                    # Scroll and wait for dynamic content to load
-                    scroll_to_bottom(page)
+            logging.info("Handling age confirmation...")
+            handle_age_confirmation(page)
 
-                    # Wait for any final asynchronous operations
-                    page.wait_for_timeout(5000)
+            logging.info("Scrolling to bottom of page...")
+            scroll_to_bottom(page)
 
-                    # Ensure we've captured all GraphQL responses
-                    page.reload()
-                    page.wait_for_load_state("networkidle", timeout=REQUEST_TIMEOUT)
+            while True:
+                logging.info("Waiting for new responses...")
+                page.wait_for_timeout(5000)
 
-                    # If we've reached this point without a timeout, break the retry loop
+                if time.time() - last_response_time > no_new_responses_timeout:
+                    logging.info(f"No new responses received in the last {no_new_responses_timeout} seconds. Concluding scrape.")
                     break
 
-                except PlaywrightTimeoutError:
-                    timeout_retries += 1
-                    logging.warning(
-                        f"Timeout occurred for URL: {url}. Retry attempt {timeout_retries} of {max_timeout_retries}")
-                    save_progress(progress_file, url_responses, graphql_url)
-                    if timeout_retries > max_timeout_retries:
-                        logging.error(f"Max timeout retries reached for URL: {url}. Moving to next URL.")
-                        return
-                    time.sleep(10)  # Wait for 10 seconds before retrying
-                    continue
+            logging.info("Scraping completed successfully")
 
-            except PlaywrightError as e:
-                logging.error(f"Playwright error while scraping {url}: {str(e)}")
-                save_progress(progress_file, url_responses, graphql_url)
-                raise
-            except Exception as e:
-                logging.error(f"Unexpected error while scraping {url}: {str(e)}")
-                save_progress(progress_file, url_responses, graphql_url)
-                raise
-            finally:
-                if 'browser' in locals():
-                    browser.close()
+        except PlaywrightTimeoutError as e:
+            logging.warning(f"Timeout occurred for URL: {url}.")
+            raise e
+        except Exception as e:
+            logging.error(f"Unexpected error while scraping {url}: {str(e)}")
+            raise e
+        finally:
+            if 'context' in locals() and 'page' in locals():
+                logging.info("Closing browser context and page...")
+                page.close()
+                context.close()
+            elif 'browser' in locals():
+                logging.info("Closing browser...")
+                browser.close()
 
-    # Process and save CSV for this URL
-    if url_responses:
-        output_file = f"output_{sanitized_url}_{int(time.time())}.csv"
-        try:
-            process_graphql_responses(url_responses, output_file, graphql_url)
-            logging.info(f"Data written to {output_file} for URL: {url}")
-            # Remove progress file after successful scraping
+            # Always try to save progress and write final CSVs
+            save_progress(progress_file, url_responses, api_url)
+            timestamp = int(time.time())
+            final_output_file_dutchie = os.path.join(output_folder, f"final_output_dutchie_{sanitized_url}_{timestamp}.csv")
+            final_output_file_generic = os.path.join(output_folder, f"final_output_generic_{sanitized_url}_{timestamp}.csv")
+            final_output_file_unflattened = os.path.join(output_folder, f"final_output_unflattened_{sanitized_url}_{timestamp}.csv")
+            final_output_file_cleaned = os.path.join(output_folder, f"final_output_cleaned_{sanitized_url}_{timestamp}.csv")
+
+            if "dutchie.com" in api_url.lower():
+                process_graphql_responses(url_responses, final_output_file_dutchie, final_output_file_generic, final_output_file_unflattened, api_url)
+            else:
+                process_api_responses(url_responses, final_output_file_cleaned, final_output_file_generic, final_output_file_unflattened, api_url)
+
+            # Delete progress file after successful scraping
             if os.path.exists(progress_file):
                 os.remove(progress_file)
+                logging.info(f"Deleted progress file: {progress_file}")
+
+            # Delete non-final output files
+            if "dutchie.com" in api_url.lower():
+                for file_pattern in [f"output_dutchie_{sanitized_url}_*.csv",
+                                     f"output_generic_{sanitized_url}_*.csv",
+                                     f"output_unflattened_{sanitized_url}_*.csv"]:
+                    for file_to_delete in glob.glob(os.path.join(output_folder, file_pattern)):
+                        try:
+                            os.remove(file_to_delete)
+                            logging.info(f"Deleted non-final output file: {file_to_delete}")
+                        except Exception as e:
+                            logging.error(f"Error deleting file {file_to_delete}: {str(e)}")
+            else:
+                for file_pattern in [f"output_cleaned_{sanitized_url}_*.csv",
+                                     f"output_generic_{sanitized_url}_*.csv",
+                                     f"output_unflattened_{sanitized_url}_*.csv"]:
+                    for file_to_delete in glob.glob(os.path.join(output_folder, file_pattern)):
+                        try:
+                            os.remove(file_to_delete)
+                            logging.info(f"Deleted non-final output file: {file_to_delete}")
+                        except Exception as e:
+                            logging.error(f"Error deleting file {file_to_delete}: {str(e)}")
+
+    logging.info(f"Scraping process completed for URL: {url}")
+    return url_responses
+
+
+# Update the main function to handle each URL separately
+def main(urls: List[str]):
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        for url in urls:
+            try:
+                responses = scrape_url(url)
+                if responses:
+                    logging.info(f"Successfully scraped {url} and saved data to CSV.")
+                else:
+                    logging.warning(f"No data collected for {url}.")
+            except Exception as e:
+                logging.error(f"Failed to scrape {url}: {str(e)}")
+            finally:
+                logging.info(f"Moving to next URL (if any).")
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received. Shutting down gracefully...")
+    except Exception as e:
+        logging.error(f"Unexpected error in main: {str(e)}")
+    finally:
+        logging.info("Scraping process completed for all URLs.")
+
+
+# Keep the signal handler as before
+def signal_handler(signum, frame):
+    raise KeyboardInterrupt("Received interrupt signal")
+
+
+# Modify the main function to handle keyboard interrupts
+def main(urls: List[str]):
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        for url in urls:
+            try:
+                scrape_url(url)
+            except Exception as e:
+                logging.error(f"Failed to scrape {url}: {str(e)}")
+                continue
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received. Shutting down gracefully...")
+    except Exception as e:
+        logging.error(f"Unexpected error in main: {str(e)}")
+    finally:
+        logging.info("Scraping process completed.")
+
+
+# Modify the signal handler to raise a KeyboardInterrupt
+def signal_handler(signum, frame):
+    raise KeyboardInterrupt("Received interrupt signal")
+
+
+def write_results_to_csv(responses, sanitized_url, graphql_url):
+    if responses:
+        output_file = f"output_{sanitized_url}_{int(time.time())}.csv"
+        try:
+            logging.info(f"Processing GraphQL responses and saving to CSV: {output_file}")
+            process_api_responses(responses, output_file, graphql_url)
+            logging.info(f"Data written to {output_file}")
         except IOError as e:
-            logging.error(f"IOError while writing CSV for URL {url}: {str(e)}")
+            logging.error(f"IOError while writing CSV: {str(e)}")
         except Exception as e:
-            logging.error(f"Unexpected error while processing data for URL {url}: {str(e)}")
+            logging.error(f"Unexpected error while processing data: {str(e)}")
     else:
-        logging.warning(f"No GraphQL responses collected for URL: {url}")
+        logging.warning(f"No GraphQL responses to write to CSV.")
 
 
 def scrape_urls_parallel(urls: List[str]):
